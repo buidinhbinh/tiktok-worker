@@ -1,13 +1,8 @@
 /**
  * TIKTOK QR CODE HEADLESS WORKER (CHUẨN NAPXU.VN)
  * -------------------------------------------------------------
- * Chạy trên máy tính hoặc VPS có cài đặt Google Chrome hoặc Microsoft Edge.
- * Cơ chế:
- * 1. Mở TikTok ngầm bằng Trình duyệt thật (Chromium/Edge) có hỗ trợ JS MSSDK.
- * 2. Lấy ảnh QR trực tiếp từ <canvas> của TikTok.
- * 3. Khi người dùng quét app và bấm "Xác nhận" trên điện thoại:
- *    Trình duyệt tự động nhận diện đăng nhập, bắt lấy sessionid và Cookie thật!
- * 4. Trả kết quả về cho Website PHP lưu vào database.
+ * Chạy trên Render.com, VPS hoặc máy tính cá nhân.
+ * Hỗ trợ Chromium/Edge Headless và tự động fallback API TikTok.
  */
 
 const http = require('http');
@@ -17,21 +12,35 @@ const os = require('os');
 const path = require('path');
 const url = require('url');
 
+// Bắt lỗi toàn cục để server KHÔNG BAO GIỜ bị crash
+process.on('uncaughtException', (err) => {
+  console.error('[Worker uncaughtException]:', err?.message || err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[Worker unhandledRejection]:', reason);
+});
+
+let WebSocketClient = globalThis.WebSocket;
+try {
+  if (!WebSocketClient) {
+    WebSocketClient = require('ws');
+  }
+} catch (e) {}
+
 const PORT = process.env.PORT || 5050;
 
-// Tìm đường dẫn Chrome hoặc Edge trên hệ thống
 function getBrowserExecutable() {
   if (process.env.PUPPETEER_EXECUTABLE_PATH) return process.env.PUPPETEER_EXECUTABLE_PATH;
   if (process.env.CHROME_BIN) return process.env.CHROME_BIN;
   const possiblePaths = [
-    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
-    'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
-    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
     '/usr/bin/chromium',
     '/usr/bin/chromium-browser',
     '/usr/bin/google-chrome-stable',
-    '/usr/bin/google-chrome'
+    '/usr/bin/google-chrome',
+    'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+    'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe'
   ];
   for (const p of possiblePaths) {
     if (fs.existsSync(p)) return p;
@@ -49,6 +58,7 @@ class QRSession {
     this.cookies = null;
     this.sessionId = null;
     this.account = null;
+    this.apiToken = null;
     this.createdAt = Date.now();
     this.port = 9300 + Math.floor(Math.random() * 500);
     this.userDir = path.join(os.tmpdir(), `tt_qr_profile_${this.id}`);
@@ -59,86 +69,137 @@ class QRSession {
   async start() {
     const browserPath = getBrowserExecutable();
     if (!browserPath) {
-      this.status = 'error';
-      this.error = 'Không tìm thấy trình duyệt Edge hoặc Chrome!';
+      console.log(`[QRSession ${this.id}] Không tìm thấy trình duyệt, dùng API fallback trực tiếp.`);
+      await this.fallbackGetQR();
       return;
     }
 
-    this.browserProc = spawn(browserPath, [
-      '--headless=new',
-      `--remote-debugging-port=${this.port}`,
-      `--user-data-dir=${this.userDir}`,
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--no-first-run',
-      '--no-default-browser-check',
-      '--disable-background-networking',
-      'https://www.tiktok.com/login/qrcode'
-    ]);
+    try {
+      this.browserProc = spawn(browserPath, [
+        '--headless=new',
+        `--remote-debugging-port=${this.port}`,
+        `--user-data-dir=${this.userDir}`,
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-software-rasterizer',
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--disable-background-networking',
+        'https://www.tiktok.com/login/qrcode'
+      ]);
 
-    // Đợi trình duyệt khởi động và lấy WebSocket URL
-    let retries = 0;
-    let wsUrl = null;
-    while (retries < 15 && !wsUrl) {
-      await new Promise(r => setTimeout(r, 600));
-      try {
-        const res = await fetch(`http://127.0.0.1:${this.port}/json`);
-        const tabs = await res.json();
-        const ttTab = tabs.find(t => t.url && t.url.includes('tiktok.com'));
-        if (ttTab && ttTab.webSocketDebuggerUrl) {
-          wsUrl = ttTab.webSocketDebuggerUrl;
-        }
-      } catch (e) {
-        // Tiếp tục đợi
+      let retries = 0;
+      let wsUrl = null;
+      while (retries < 10 && !wsUrl) {
+        await new Promise(r => setTimeout(r, 500));
+        try {
+          const res = await fetch(`http://127.0.0.1:${this.port}/json`);
+          const tabs = await res.json();
+          const ttTab = tabs.find(t => t.url && t.url.includes('tiktok.com'));
+          if (ttTab && ttTab.webSocketDebuggerUrl) {
+            wsUrl = ttTab.webSocketDebuggerUrl;
+          }
+        } catch (e) {}
+        retries++;
       }
-      retries++;
-    }
 
-    if (!wsUrl) {
+      if (wsUrl && WebSocketClient) {
+        this.ws = new WebSocketClient(wsUrl);
+        this.ws.onopen = () => {
+          try {
+            this.ws.send(JSON.stringify({ id: 10, method: 'Network.enable' }));
+            this.pollForQR();
+            this.pollForCookies();
+          } catch (e) {}
+        };
+
+        this.ws.onmessage = (event) => {
+          try {
+            const dataStr = typeof event.data === 'string' ? event.data : event.data.toString();
+            const msg = JSON.parse(dataStr);
+            if (msg.id === 20 && msg.result?.result?.value) {
+              const val = msg.result.result.value;
+              if (val.startsWith('data:image')) {
+                this.qrImage = val;
+                this.status = 'waiting_scan';
+              }
+            }
+            if (msg.id === 30 && msg.result?.cookies) {
+              const cookiesList = msg.result.cookies;
+              const sessionCookie = cookiesList.find(c => c.name === 'sessionid' || c.name === 'sessionid_ss');
+              if (sessionCookie && sessionCookie.value) {
+                this.sessionId = sessionCookie.value;
+                this.cookies = cookiesList.map(c => `${c.name}=${c.value}`).join('; ');
+                this.status = 'confirmed';
+                this.fetchProfileInfo();
+              }
+            }
+          } catch (e) {}
+        };
+      } else {
+        console.log(`[QRSession ${this.id}] DevTools chưa sẵn sàng, gọi API fallback.`);
+        await this.fallbackGetQR();
+      }
+    } catch (e) {
+      console.log(`[QRSession ${this.id}] Trình duyệt lỗi: ${e.message}, gọi API fallback.`);
+      await this.fallbackGetQR();
+    }
+  }
+
+  async fallbackGetQR() {
+    try {
+      const res = await fetch('https://www.tiktok.com/passport/web/get_qrcode/?next=https%3A%2F%2Fwww.tiktok.com&aid=1459', {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
+          'Referer': 'https://www.tiktok.com/login/qrcode',
+          'Accept': 'application/json, text/javascript'
+        }
+      });
+      const data = await res.json();
+      if (data?.data?.qrcode) {
+        this.qrImage = 'data:image/png;base64,' + data.data.qrcode;
+        this.apiToken = data.data.token;
+        this.status = 'waiting_scan';
+        this.pollApiCheck();
+      }
+    } catch (e) {
       this.status = 'error';
-      this.error = 'Không thể kết nối DevTools của trình duyệt!';
-      this.destroy();
-      return;
+      this.error = 'Không thể lấy mã QR từ TikTok lúc này!';
     }
+  }
 
-    // Kết nối WebSocket DevTools
-    this.ws = new WebSocket(wsUrl);
-    this.ws.onopen = () => {
-      // Bật Network domain để lấy Cookies
-      this.ws.send(JSON.stringify({ id: 10, method: 'Network.enable' }));
-      this.pollForQR();
-      this.pollForCookies();
-    };
-
-    this.ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data);
-        if (msg.id === 20 && msg.result?.result?.value) {
-          const val = msg.result.result.value;
-          if (val.startsWith('data:image')) {
-            this.qrImage = val;
-            this.status = 'waiting_scan';
-          }
+  async pollApiCheck() {
+    if (this.status === 'confirmed' || this.status === 'closed' || !this.apiToken) return;
+    try {
+      const res = await fetch(`https://www.tiktok.com/passport/web/check_qrconnect/?next=https%3A%2F%2Fwww.tiktok.com&token=${encodeURIComponent(this.apiToken)}&aid=1459`, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
+          'Referer': 'https://www.tiktok.com/login/qrcode'
         }
-        if (msg.id === 30 && msg.result?.cookies) {
-          const cookiesList = msg.result.cookies;
-          const sessionCookie = cookiesList.find(c => c.name === 'sessionid' || c.name === 'sessionid_ss');
-          if (sessionCookie && sessionCookie.value) {
-            this.sessionId = sessionCookie.value;
-            this.cookies = cookiesList.map(c => `${c.name}=${c.value}`).join('; ');
-            this.status = 'confirmed';
-            this.fetchProfileInfo();
-          }
-        }
-      } catch (e) {}
-    };
+      });
+      const setCookie = res.headers.get('set-cookie') || '';
+      const m = setCookie.match(/sessionid=([^;]+)/);
+      if (m && m[1]) {
+        this.sessionId = m[1];
+        this.cookies = setCookie;
+        this.status = 'confirmed';
+        this.fetchProfileInfo();
+        return;
+      }
+      const data = await res.json();
+      if (data?.data?.status === 'expired') {
+        this.status = 'expired';
+        return;
+      }
+    } catch (e) {}
+    setTimeout(() => this.pollApiCheck(), 2500);
   }
 
   pollForQR() {
     if (this.status === 'confirmed' || this.status === 'closed') return;
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+    if (this.ws && (this.ws.readyState === 1 || this.ws.readyState === (WebSocketClient ? WebSocketClient.OPEN : 1))) {
       this.ws.send(JSON.stringify({
         id: 20,
         method: 'Runtime.evaluate',
@@ -166,7 +227,7 @@ class QRSession {
       this.destroy();
       return;
     }
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+    if (this.ws && (this.ws.readyState === 1 || this.ws.readyState === (WebSocketClient ? WebSocketClient.OPEN : 1))) {
       this.ws.send(JSON.stringify({
         id: 30,
         method: 'Network.getCookies',
@@ -194,8 +255,7 @@ class QRSession {
         };
       }
     } catch (e) {}
-    // Sau khi xác nhận thành công 5 giây thì đóng trình duyệt để giải phóng RAM
-    setTimeout(() => this.destroy(), 5000);
+    setTimeout(() => this.destroy(), 8000);
   }
 
   destroy() {
@@ -207,7 +267,6 @@ class QRSession {
       try { this.browserProc.kill(); } catch (e) {}
       this.browserProc = null;
     }
-    // Dọn dẹp thư mục tạm
     setTimeout(() => {
       try { fs.rmSync(this.userDir, { recursive: true, force: true }); } catch (e) {}
     }, 2000);
@@ -236,11 +295,16 @@ const server = http.createServer(async (req, res) => {
     sessions.set(id, session);
     session.start();
 
-    // Đợi tối đa 6 giây để có ảnh QR
+    // Đợi tối đa 5 giây để có ảnh QR
     let wait = 0;
-    while (wait < 12 && !session.qrImage && session.status !== 'error') {
+    while (wait < 10 && !session.qrImage && session.status !== 'error') {
       await new Promise(r => setTimeout(r, 500));
       wait++;
+    }
+
+    // Nếu trình duyệt chưa kịp có, gọi fallback trực tiếp
+    if (!session.qrImage) {
+      await session.fallbackGetQR();
     }
 
     if (session.qrImage) {
@@ -250,7 +314,7 @@ const server = http.createServer(async (req, res) => {
         qr_id: id,
         qr_image: session.qrImage,
         time_remaining: 180,
-        msg: 'Đã tạo mã QR TikTok qua Trình duyệt thành công!'
+        msg: 'Đã tạo mã QR TikTok thành công!'
       }));
     } else {
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -280,7 +344,7 @@ const server = http.createServer(async (req, res) => {
         session_id: session.sessionId,
         cookies: session.cookies,
         account: session.account || {
-          username: 'user_' + session.sessionId.slice(0, 8),
+          username: 'user_' + (session.sessionId ? session.sessionId.slice(0, 8) : 'tiktok'),
           nickname: 'TikTok User',
           avatar: ''
         },
@@ -315,7 +379,7 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log(`=======================================================`);
-  console.log(`[TikTok QR Worker] Server đang chạy tại http://localhost:${PORT}`);
+  console.log(`[TikTok QR Worker] Server đang chạy tại cổng ${PORT}`);
   console.log(`Browser: ${getBrowserExecutable()}`);
   console.log(`=======================================================`);
 });
