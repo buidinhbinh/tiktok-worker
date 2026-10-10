@@ -239,7 +239,7 @@ class QRSession {
 
   async fetchProfileInfo() {
     try {
-      const res = await fetch('https://www.tiktok.com/passport/web/account/info/', {
+      const res = await fetch('https://www.tiktok.com/passport/web/account/info/?aid=1459', {
         headers: {
           'Cookie': this.cookies,
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
@@ -247,14 +247,39 @@ class QRSession {
         }
       });
       const data = await res.json();
-      if (data?.data?.username) {
+      const uName = data?.data?.username || data?.data?.screen_name || data?.data?.name;
+      if (uName) {
         this.account = {
-          username: data.data.username,
-          nickname: data.data.screen_name || data.data.username,
-          avatar: data.data.avatar_url || ''
+          username: uName.replace(/^@/, ''),
+          nickname: data?.data?.screen_name || uName,
+          avatar: data?.data?.avatar_url || ''
         };
       }
     } catch (e) {}
+
+    if (!this.account) {
+      try {
+        const res2 = await fetch('https://www.tiktok.com/', {
+          headers: {
+            'Cookie': this.cookies,
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36'
+          }
+        });
+        const html = await res2.text();
+        const m = html.match(/<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)<\/script>/s);
+        if (m) {
+          const d = JSON.parse(m[1]);
+          const u = d?.['__DEFAULT_SCOPE__']?.['webapp.app-context']?.user;
+          if (u?.uniqueId) {
+            this.account = {
+              username: u.uniqueId,
+              nickname: u.nickName || u.uniqueId,
+              avatar: u.avatarLarger || u.avatarThumb || ''
+            };
+          }
+        }
+      } catch (e) {}
+    }
     setTimeout(() => this.destroy(), 8000);
   }
 
