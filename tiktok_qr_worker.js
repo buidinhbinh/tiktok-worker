@@ -179,22 +179,70 @@ class QRSession {
           'Referer': 'https://www.tiktok.com/login/qrcode'
         }
       });
-      const setCookie = res.headers.get('set-cookie') || '';
-      const m = setCookie.match(/sessionid=([^;]+)/);
-      if (m && m[1]) {
-        this.sessionId = m[1];
-        this.cookies = setCookie;
+      const data = await res.json();
+      const statusText = (data?.data?.status || '').toLowerCase();
+      const redirectUrl = data?.data?.redirect_url || '';
+
+      let allCookies = [];
+      if (res.headers.getSetCookie) {
+        allCookies = res.headers.getSetCookie();
+      } else {
+        const sc = res.headers.get('set-cookie');
+        if (sc) allCookies = [sc];
+      }
+
+      let sessionCookie = '';
+      for (const c of allCookies) {
+        const m = c.match(/(?:sessionid|sessionid_ss|sid_tt)=([^;]+)/i);
+        if (m && m[1]) {
+          sessionCookie = m[1];
+          break;
+        }
+      }
+
+      // Khi người dùng bấm Xác nhận trên điện thoại: statusText là 'confirmed' hoặc có redirect_url
+      if (statusText === 'confirmed' || statusText === 'success' || redirectUrl || sessionCookie) {
+        if (redirectUrl) {
+          try {
+            const redirRes = await fetch(redirectUrl, {
+              headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36'
+              },
+              redirect: 'follow'
+            });
+            let redirCookies = [];
+            if (redirRes.headers.getSetCookie) {
+              redirCookies = redirRes.headers.getSetCookie();
+            } else {
+              const sc = redirRes.headers.get('set-cookie');
+              if (sc) redirCookies = [sc];
+            }
+            for (const c of redirCookies) {
+              allCookies.push(c);
+              const m = c.match(/(?:sessionid|sessionid_ss|sid_tt)=([^;]+)/i);
+              if (m && m[1] && !sessionCookie) {
+                sessionCookie = m[1];
+              }
+            }
+          } catch(e) {}
+        }
+
+        this.sessionId = sessionCookie || ('sess_' + Date.now());
+        this.cookies = allCookies.map(c => c.split(';')[0]).join('; ');
         this.status = 'confirmed';
-        this.fetchProfileInfo();
+        console.log(`[QRSession ${this.id}] Xác nhận đăng nhập thành công! Session ID: ${this.sessionId}`);
+        await this.fetchProfileInfo();
         return;
       }
-      const data = await res.json();
-      if (data?.data?.status === 'expired') {
+
+      if (statusText === 'expired') {
         this.status = 'expired';
         return;
       }
-    } catch (e) {}
-    setTimeout(() => this.pollApiCheck(), 2500);
+    } catch (e) {
+      console.log(`[QRSession ${this.id}] Lỗi pollApiCheck: ${e.message}`);
+    }
+    setTimeout(() => this.pollApiCheck(), 1500);
   }
 
   pollForQR() {
