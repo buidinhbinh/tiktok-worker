@@ -1,0 +1,10 @@
+{
+  "name": "tiktok-qr-worker",
+  "version": "1.0.0",
+  "description": "TikTok QR Headless Worker for napxu-style coin topup sites",
+  "main": "tiktok_qr_worker.js",
+  "scripts": {
+    "start": "node tiktok_qr_worker.js"
+  },
+  "dependencies": {}
+}
