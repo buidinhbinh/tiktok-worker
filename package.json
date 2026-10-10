@@ -6,5 +6,7 @@
   "scripts": {
     "start": "node tiktok_qr_worker.js"
   },
-  "dependencies": {}
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
 }
