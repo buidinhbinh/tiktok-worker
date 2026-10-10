@@ -1,4 +1,4 @@
-FROM node:20-slim
+FROM node:22-bookworm-slim
 
 # Cài đặt Chromium và các font/thư viện đồ họa cần thiết cho Linux
 RUN apt-get update && apt-get install -y \
